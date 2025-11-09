@@ -1,0 +1,1 @@
+This file implements a small file-transfer utility with two execution modes: a networked TCP server/client pair (default) and a filesystem-only local mode compiled with -DNO_NETWORK. The implementation focuses on a simple, newline-delimited control protocol and binary-safe, size-prefixed file transfers.
