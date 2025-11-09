@@ -1,13 +1,5 @@
 
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -24,6 +16,17 @@ namespace fs = std::filesystem;
 static const int DEFAULT_PORT = 12345;
 static const int BACKLOG = 10;
 static const size_t BUFFER_SIZE = 8192;
+
+// If NO_NETWORK is NOT defined, include socket headers and compile network code.
+#ifndef NO_NETWORK
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 // Helper: send all bytes
 ssize_t sendAll(int sock, const char* buf, size_t len) {
@@ -53,7 +56,7 @@ ssize_t recvExact(int sock, char* buf, size_t len) {
     return (ssize_t)total;
 }
 
-// Read a line (ending with '\n'), return without newline. Returns empty string on EOF or error (and sets eof flag).
+// Read a line (ending with '\n'), return without newline. Returns false on EOF/error.
 bool readLine(int sock, std::string& outLine) {
     outLine.clear();
     char ch;
@@ -174,7 +177,7 @@ void handle_client(int client_sock, fs::path serve_dir) {
             if (!ofs) {
                 sendLine(client_sock, "ERR");
                 sendLine(client_sock, "Failed to create file");
-                // drain incoming data to keep stream consistent? We'll attempt to read and discard
+                // drain incoming data to keep stream consistent
                 unsigned long long toDiscard = size;
                 std::vector<char> discardBuf(4096);
                 while (toDiscard > 0) {
@@ -459,16 +462,141 @@ void run_client(const std::string& host, int port) {
     std::cout << "Disconnected.\n";
 }
 
+#else // NO_NETWORK
+
+// When NO_NETWORK is defined we provide a local mode that simulates client operations
+// by directly operating on a serve_dir on the filesystem. This compiles in environments
+// with no socket headers available (e.g., online editors that restrict networking).
+
+// Sanitize filename: disallow path separators and parent traversal
+bool isSafeFilename(const std::string& fn) {
+    if (fn.empty()) return false;
+    if (fn.find('/') != std::string::npos) return false;
+    if (fn.find('\\') != std::string::npos) return false;
+    if (fn.find("..") != std::string::npos) return false;
+    return true;
+}
+
+void do_list(fs::path serve_dir) {
+    try {
+        if (!fs::exists(serve_dir)) fs::create_directories(serve_dir);
+    } catch (...) {}
+    for (auto& entry : fs::directory_iterator(serve_dir)) {
+        std::string name = entry.path().filename().string();
+        if (entry.is_regular_file()) {
+            std::cout << name << "\tfile\n";
+        } else if (entry.is_directory()) {
+            std::cout << name << "\tdir\n";
+        } else {
+            std::cout << name << "\tother\n";
+        }
+    }
+}
+
+void do_get(fs::path serve_dir, const std::string& filename) {
+    if (!isSafeFilename(filename)) {
+        std::cerr << "Invalid filename\n";
+        return;
+    }
+    fs::path src = serve_dir / filename;
+    if (!fs::exists(src) || !fs::is_regular_file(src)) {
+        std::cerr << "File not found on server: " << filename << "\n";
+        return;
+    }
+    std::ifstream ifs(src, std::ios::binary);
+    if (!ifs) {
+        std::cerr << "Failed to open server file\n";
+        return;
+    }
+    std::ofstream ofs(filename, std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Failed to open local file for writing\n";
+        return;
+    }
+    std::vector<char> buf(BUFFER_SIZE);
+    while (ifs) {
+        ifs.read(buf.data(), buf.size());
+        std::streamsize r = ifs.gcount();
+        if (r > 0) ofs.write(buf.data(), r);
+    }
+    std::cout << "Downloaded " << filename << " (" << fs::file_size(src) << " bytes)\n";
+}
+
+void do_put(fs::path serve_dir, const std::string& filename) {
+    if (!isSafeFilename(filename)) {
+        std::cerr << "Invalid filename\n";
+        return;
+    }
+    fs::path src = filename;
+    if (!fs::exists(src) || !fs::is_regular_file(src)) {
+        std::cerr << "Local file not found: " << filename << "\n";
+        return;
+    }
+    try {
+        if (!fs::exists(serve_dir)) fs::create_directories(serve_dir);
+    } catch (...) {}
+    fs::path dst = serve_dir / filename;
+    std::ifstream ifs(src, std::ios::binary);
+    if (!ifs) {
+        std::cerr << "Failed to open local file for reading\n";
+        return;
+    }
+    std::ofstream ofs(dst, std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Failed to create server file\n";
+        return;
+    }
+    std::vector<char> buf(BUFFER_SIZE);
+    while (ifs) {
+        ifs.read(buf.data(), buf.size());
+        std::streamsize r = ifs.gcount();
+        if (r > 0) ofs.write(buf.data(), r);
+    }
+    std::cout << "Uploaded " << filename << " to server directory\n";
+}
+
+void run_local(fs::path serve_dir) {
+    std::cout << "Running in local mode (NO_NETWORK). Serving directory: " << serve_dir << "\n";
+    std::string cmd;
+    while (true) {
+        std::cout << "> ";
+        if (!std::getline(std::cin, cmd)) break;
+        if (cmd.empty()) continue;
+
+        if (cmd.rfind("LIST", 0) == 0) {
+            do_list(serve_dir);
+        } else if (cmd.rfind("GET ", 0) == 0) {
+            std::string filename = cmd.substr(4);
+            do_get(serve_dir, filename);
+        } else if (cmd.rfind("PUT ", 0) == 0) {
+            std::string filename = cmd.substr(4);
+            do_put(serve_dir, filename);
+        } else if (cmd.rfind("QUIT", 0) == 0) {
+            break;
+        } else {
+            std::cout << "Unknown command. Supported: LIST, GET <file>, PUT <file>, QUIT\n";
+        }
+    }
+    std::cout << "Local mode exited.\n";
+}
+
+#endif // NO_NETWORK
+
 // Simple argument parser
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cout << "Usage:\n"
+#ifndef NO_NETWORK
                   << "  Server: " << argv[0] << " --server [--port <port>] [--dir <serve_dir>]\n"
                   << "  Client: " << argv[0] << " --client <host> [--port <port>]\n";
+#else
+                  << "  Local (no-network) mode: " << argv[0] << " --local [--dir <serve_dir>]\n";
+#endif
         return 0;
     }
 
     std::string mode = argv[1];
+#ifndef NO_NETWORK
     if (mode == "--server") {
         int port = DEFAULT_PORT;
         fs::path dir = fs::current_path();
@@ -499,6 +627,21 @@ int main(int argc, char* argv[]) {
         std::cerr << "Unknown mode. Use --server or --client\n";
         return 1;
     }
+#else
+    if (mode == "--local") {
+        fs::path dir = fs::current_path();
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--dir" && i + 1 < argc) {
+                dir = argv[++i];
+            }
+        }
+        run_local(dir);
+    } else {
+        std::cerr << "Unknown mode. Use --local (compiled with NO_NETWORK)\n";
+        return 1;
+    }
+#endif
 
     return 0;
 }
